@@ -761,9 +761,13 @@ async function storageSet(key, value){
    from the sheet. Manual "Sync now" also available in the UI. */
 let pollTimer = null;
 let applyingRemoteUpdate = false;
+let saveInFlight = 0;        // count of local saves currently being written to the sheet
+let lastLocalSaveTs = 0;     // timestamp of the last local save, for a short settle window
 
 async function pollForRemoteChanges(){
   if(window.storage || !getSheetsSyncUrl()) return; // Claude.ai mode doesn't use Sheets
+  if(saveInFlight > 0) return; // a local save is still writing — don't read while that's in progress
+  if(Date.now() - lastLocalSaveTs < 4000) return; // brief settle window after our own save
   try{
     const json = await sheetsLoad();
     if(!json) return;
@@ -772,6 +776,8 @@ async function pollForRemoteChanges(){
     const nextLog = Array.isArray(parsed) ? [] : (parsed.log || []);
     // only apply if it actually differs, to avoid pointless re-renders
     if(JSON.stringify(nextDB) === JSON.stringify(DB) && JSON.stringify(nextLog) === JSON.stringify(LOG)) return;
+    // double-check nothing started saving while we were fetching
+    if(saveInFlight > 0) return;
     applyingRemoteUpdate = true;
     DB = nextDB;
     LOG = nextLog;
@@ -800,6 +806,7 @@ function setSyncStatus(state){
 }
 
 async function manualSyncNow(){
+  if(saveInFlight > 0) return;
   setSyncStatus('syncing');
   await pollForRemoteChanges();
   await saveDB();
@@ -831,9 +838,12 @@ async function loadDB(){
 
 async function saveDB(){
   if(applyingRemoteUpdate) return; // avoid feedback loop while applying an incoming update
+  saveInFlight++;
   try{
     await storageSet(STORAGE_KEY, JSON.stringify({assets: DB, log: LOG}));
+    lastLocalSaveTs = Date.now();
   }catch(e){ console.error('Storage error', e); }
+  finally{ saveInFlight--; }
 }
 
 
