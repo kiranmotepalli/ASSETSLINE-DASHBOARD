@@ -921,24 +921,48 @@ async function connectToSheetsAndReconcile(){
 }
 
 async function loadDB(){
-  try{
-    const res = await storageGet(STORAGE_KEY);
-    if(res && res.value){
-      const parsed = JSON.parse(res.value);
+  // Step 1: load whatever's cached on THIS device first. This is the
+  // fix for "disappears after refresh" — the app used to fetch straight
+  // from the cloud on every load and use that as the only source, which
+  // meant if the last cloud write hadn't fully landed (or silently
+  // failed — Apps Script can drop POST data on its redirect in some
+  // cases), a refresh would show the older cloud copy and anything
+  // added since would appear to vanish. Now the local cache is always
+  // the starting point, so a refresh can never lose something that was
+  // already saved on this device.
+  let localJson = null;
+  if(window.storage && typeof window.storage.get === 'function'){
+    try{
+      const res = await window.storage.get(STORAGE_KEY, false);
+      if(res && res.value) localJson = res.value;
+    }catch(e){ /* fall through to localStorage */ }
+  }
+  if(!localJson){
+    localJson = localStorage.getItem(STORAGE_KEY);
+  }
+
+  if(localJson){
+    try{
+      const parsed = JSON.parse(localJson);
       if(Array.isArray(parsed)){ DB = parsed; LOG = []; }
       else { DB = parsed.assets || []; LOG = parsed.log || []; }
-    } else {
-      DB = SEED.map(r => ({...r}));
-      LOG = [];
-      await saveDB();
-    }
-  }catch(e){
+    }catch(e){ DB = []; LOG = []; }
+  } else {
     DB = SEED.map(r => ({...r}));
     LOG = [];
-    await saveDB();
   }
   DB.forEach((r,i)=> { if(!r._id) r._id = genId(); });
   renderAll();
+
+  // Step 2: reconcile with the cloud (if configured) using the same safe
+  // union merge as everywhere else — this can only add to what's shown,
+  // never remove, so it's safe to run automatically on every load.
+  if(!window.storage && getSheetsSyncUrl()){
+    await syncWithCloud();
+  } else if(!localJson){
+    await saveDB(); // brand new device/session with nothing saved yet — persist the seed
+  }
+
   setSyncStatus(getSheetsSyncUrl() ? 'ok' : null);
   startPolling();
 }
