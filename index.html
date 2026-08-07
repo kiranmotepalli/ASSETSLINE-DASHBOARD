@@ -444,12 +444,14 @@ textarea#importArea{ width:100%; min-height:160px; font-family: var(--mono); fon
       <div class="panel">
         <div class="panel-head"><div class="panel-title">Cloud Sync (Google Sheets)<span class="tag" id="syncStatusBadge">Cloud sync: not configured</span></div></div>
         <div class="import-help">
-          Paste the Web App URL from your Google Apps Script deployment here to sync this device's data through a shared Google Sheet. See the deployment guide for how to set that up — it only needs to be done once, then every device using this URL stays in sync (checked automatically every 20 seconds, or tap "Sync now" any time).
+          Paste the Web App URL from your Google Apps Script deployment here to sync this device's data through a shared Google Sheet. See the deployment guide for how to set that up — it only needs to be done once, then every device using this URL stays in sync (checked automatically every 20 seconds, or tap "Sync now" any time).<br><br>
+          <b>"Force push"</b> is a recovery tool: use it only if this device's data is more complete/correct than what's currently in the Sheet (e.g. after a sync problem), and you want this device's copy to become the new shared version, overwriting whatever's currently in the cloud.
         </div>
         <div class="controls-row">
           <input type="text" id="sheetsUrlInput" class="search-box" placeholder="https://script.google.com/macros/s/…/exec">
           <button class="btn primary" onclick="saveSheetsUrl()">Save</button>
           <button class="btn" onclick="manualSyncNow()">↻ Sync now</button>
+          <button class="btn" style="border-color: var(--amber); color: var(--amber);" onclick="forcePushLocalToCloud()">⇧ Force push this device's data to cloud</button>
         </div>
       </div>
       <div class="panel">
@@ -774,6 +776,13 @@ async function pollForRemoteChanges(){
     const parsed = JSON.parse(json);
     const nextDB = Array.isArray(parsed) ? parsed : (parsed.assets || []);
     const nextLog = Array.isArray(parsed) ? [] : (parsed.log || []);
+    // Safety: never let an empty/smaller remote silently wipe out real local
+    // data during routine polling — that almost always means the remote
+    // hasn't caught up yet, not that data was deliberately deleted
+    // elsewhere. Real deletions (Reset database) push immediately, so
+    // they still propagate — this only guards against accidentally
+    // applying a stale/empty read.
+    if(nextDB.length === 0 && DB.length > 0) return;
     // only apply if it actually differs, to avoid pointless re-renders
     if(JSON.stringify(nextDB) === JSON.stringify(DB) && JSON.stringify(nextLog) === JSON.stringify(LOG)) return;
     // double-check nothing started saving while we were fetching
@@ -810,6 +819,63 @@ async function manualSyncNow(){
   setSyncStatus('syncing');
   await pollForRemoteChanges();
   await saveDB();
+}
+
+/* Recovery tool: explicitly overwrite the cloud with this device's
+   current local data, bypassing the normal "remote wins if non-empty"
+   reconcile logic. Used when this device is known to hold the more
+   complete/correct copy after a sync problem elsewhere. */
+async function forcePushLocalToCloud(){
+  if(!getSheetsSyncUrl()){ alert('Set a Cloud Sync URL first.'); return; }
+  if(!confirm('This will overwrite the Google Sheet with this device\'s current data (' + DB.length + ' line items), replacing whatever is currently stored there. Continue?')) return;
+  setSyncStatus('syncing');
+  try{
+    await saveDB();
+    setSyncStatus('ok');
+    alert('This device\'s data has been pushed to the cloud.');
+  }catch(e){
+    console.error('Force push failed', e);
+    setSyncStatus('error');
+  }
+}
+
+/* Used specifically when a device connects to a Sheets URL for the first
+   time (see saveSheetsUrl). Unlike routine polling, this explicitly
+   decides which side should win when they differ:
+   - remote has real data (even if different from local)  -> remote wins,
+     this device adopts the shared data (normal "join an existing team's
+     data" case).
+   - remote is empty but this device has local data -> this device's data
+     is pushed UP to become the shared starting point (this is the "first
+     device to ever connect" case that was previously wiping data). */
+async function connectToSheetsAndReconcile(){
+  setSyncStatus('syncing');
+  try{
+    const json = await sheetsLoad();
+    const parsed = json ? JSON.parse(json) : { assets: [], log: [] };
+    const remoteDB = Array.isArray(parsed) ? parsed : (parsed.assets || []);
+    const remoteLog = Array.isArray(parsed) ? [] : (parsed.log || []);
+
+    if(remoteDB.length === 0 && DB.length > 0){
+      // Remote is empty, we have real local data — push local up to seed it.
+      await saveDB();
+    } else if(remoteDB.length > 0){
+      // Remote has real data — adopt it as the shared source of truth.
+      applyingRemoteUpdate = true;
+      DB = remoteDB;
+      LOG = remoteLog;
+      DB.forEach((r,i)=> { if(!r._id) r._id = i+1; });
+      nextId = Math.max(0, ...DB.map(r=>r._id), nextId) + 1;
+      localStorage.setItem(STORAGE_KEY, json);
+      renderAll();
+      applyingRemoteUpdate = false;
+    }
+    // both empty -> nothing to do either way
+    setSyncStatus('ok');
+  }catch(e){
+    console.error('Initial Sheets connect failed', e);
+    setSyncStatus('error');
+  }
 }
 
 async function loadDB(){
@@ -1253,7 +1319,7 @@ function saveSheetsUrl(){
   setSheetsSyncUrl(val);
   setSyncStatus(null);
   startPolling();
-  if(val) manualSyncNow();
+  if(val) connectToSheetsAndReconcile();
 }
 
 async function resetDatabase(){
