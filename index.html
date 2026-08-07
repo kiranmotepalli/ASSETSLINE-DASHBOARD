@@ -760,43 +760,91 @@ async function storageSet(key, value){
 
 /* Polling: Apps Script can't push updates like Firestore could, so instead
    we poll every 20s while the app is open and merge in anything newer
-   from the sheet. Manual "Sync now" also available in the UI. */
+   from the sheet. Manual "Sync now" also available in the UI.
+
+   IMPORTANT: this uses a MERGE strategy, not "whichever side we read
+   last wins." Two devices can add different assets between syncs, and
+   naive last-read-wins would silently drop whichever side didn't happen
+   to be read last — which is exactly the "entries disappearing" bug
+   this replaces. Instead, every sync takes the union of local + remote
+   assets (matched by branch+floor+room+category+name+make+model+serial,
+   same key the CSV import uses), so an asset only ever leaves the
+   database when a person explicitly deletes/resets it — never as a side
+   effect of timing between two devices. */
 let pollTimer = null;
 let applyingRemoteUpdate = false;
 let saveInFlight = 0;        // count of local saves currently being written to the sheet
 let lastLocalSaveTs = 0;     // timestamp of the last local save, for a short settle window
 
+function mergeAssetSets(localRows, remoteRows){
+  const map = new Map();
+  // seed with remote first, then overlay local — local wins field-level
+  // conflicts (it's the freshest thing this device just did), but any
+  // remote-only rows (added on another device) are kept, not dropped.
+  remoteRows.forEach(r=> map.set(makeKey(r), r));
+  localRows.forEach(r=> map.set(makeKey(r), r));
+  return Array.from(map.values());
+}
+
+function mergeLogs(localLog, remoteLog){
+  const map = new Map();
+  [...remoteLog, ...localLog].forEach(e=>{
+    const k = (e.ts||'') + '|' + (e.type||'') + '|' + (e.assetName||'') + '|' + (e.to||'');
+    map.set(k, e);
+  });
+  return Array.from(map.values()).sort((a,b)=> new Date(b.ts) - new Date(a.ts));
+}
+
+async function fetchRemote(){
+  const json = await sheetsLoad();
+  const parsed = json ? JSON.parse(json) : { assets: [], log: [] };
+  return {
+    assets: Array.isArray(parsed) ? parsed : (parsed.assets || []),
+    log: Array.isArray(parsed) ? [] : (parsed.log || [])
+  };
+}
+
+function applyMergedResult(mergedAssets, mergedLog){
+  applyingRemoteUpdate = true;
+  DB = mergedAssets;
+  LOG = mergedLog;
+  DB.forEach((r,i)=> { if(!r._id) r._id = i+1; });
+  nextId = Math.max(0, ...DB.map(r=>r._id), nextId, 0) + 1;
+  localStorage.setItem(STORAGE_KEY, JSON.stringify({assets: DB, log: LOG}));
+  renderAll();
+  applyingRemoteUpdate = false;
+}
+
+/* Core sync routine — fetch remote, merge with local, apply the merged
+   result locally, and (if it added anything new) push the merged result
+   back up so the cloud converges too. Used by polling, manual sync, and
+   first-time connect alike — one code path, no more special-casing. */
+async function syncWithCloud(){
+  if(!getSheetsSyncUrl()) return;
+  try{
+    const remote = await fetchRemote();
+    const mergedAssets = mergeAssetSets(DB, remote.assets);
+    const mergedLog = mergeLogs(LOG, remote.log);
+
+    const localChanged = JSON.stringify(mergedAssets) !== JSON.stringify(DB) || JSON.stringify(mergedLog) !== JSON.stringify(LOG);
+    const remoteChanged = JSON.stringify(mergedAssets) !== JSON.stringify(remote.assets) || JSON.stringify(mergedLog) !== JSON.stringify(remote.log);
+
+    if(localChanged) applyMergedResult(mergedAssets, mergedLog);
+    if(remoteChanged) await sheetsSave(JSON.stringify({assets: mergedAssets, log: mergedLog}));
+
+    lastLocalSaveTs = Date.now();
+    setSyncStatus('ok');
+  }catch(e){
+    console.error('Sync failed', e);
+    setSyncStatus('error');
+  }
+}
+
 async function pollForRemoteChanges(){
   if(window.storage || !getSheetsSyncUrl()) return; // Claude.ai mode doesn't use Sheets
-  if(saveInFlight > 0) return; // a local save is still writing — don't read while that's in progress
+  if(saveInFlight > 0) return; // a local save is still writing — don't overlap with it
   if(Date.now() - lastLocalSaveTs < 4000) return; // brief settle window after our own save
-  try{
-    const json = await sheetsLoad();
-    if(!json) return;
-    const parsed = JSON.parse(json);
-    const nextDB = Array.isArray(parsed) ? parsed : (parsed.assets || []);
-    const nextLog = Array.isArray(parsed) ? [] : (parsed.log || []);
-    // Safety: never let an empty/smaller remote silently wipe out real local
-    // data during routine polling — that almost always means the remote
-    // hasn't caught up yet, not that data was deliberately deleted
-    // elsewhere. Real deletions (Reset database) push immediately, so
-    // they still propagate — this only guards against accidentally
-    // applying a stale/empty read.
-    if(nextDB.length === 0 && DB.length > 0) return;
-    // only apply if it actually differs, to avoid pointless re-renders
-    if(JSON.stringify(nextDB) === JSON.stringify(DB) && JSON.stringify(nextLog) === JSON.stringify(LOG)) return;
-    // double-check nothing started saving while we were fetching
-    if(saveInFlight > 0) return;
-    applyingRemoteUpdate = true;
-    DB = nextDB;
-    LOG = nextLog;
-    DB.forEach((r,i)=> { if(!r._id) r._id = i+1; });
-    nextId = Math.max(0, ...DB.map(r=>r._id), nextId) + 1;
-    localStorage.setItem(STORAGE_KEY, json);
-    renderAll();
-    applyingRemoteUpdate = false;
-    setSyncStatus('ok');
-  }catch(e){ console.error('Poll failed', e); setSyncStatus('error'); }
+  await syncWithCloud();
 }
 
 function startPolling(){
@@ -817,20 +865,21 @@ function setSyncStatus(state){
 async function manualSyncNow(){
   if(saveInFlight > 0) return;
   setSyncStatus('syncing');
-  await pollForRemoteChanges();
-  await saveDB();
+  await syncWithCloud();
 }
 
-/* Recovery tool: explicitly overwrite the cloud with this device's
-   current local data, bypassing the normal "remote wins if non-empty"
-   reconcile logic. Used when this device is known to hold the more
-   complete/correct copy after a sync problem elsewhere. */
+/* Recovery tool: for the rare case the merge itself picked up something
+   unwanted (e.g. genuinely stale test data you want gone for good) and
+   you want this device's current view to become the shared version
+   outright, bypassing merge. Prefer "Sync now" for normal use — this is
+   a blunt overwrite. */
 async function forcePushLocalToCloud(){
   if(!getSheetsSyncUrl()){ alert('Set a Cloud Sync URL first.'); return; }
-  if(!confirm('This will overwrite the Google Sheet with this device\'s current data (' + DB.length + ' line items), replacing whatever is currently stored there. Continue?')) return;
+  if(!confirm('This will overwrite the Google Sheet with this device\'s current data (' + DB.length + ' line items) exactly as-is, with no merging. Use this only if you specifically want to discard whatever else is in the cloud right now. Continue?')) return;
   setSyncStatus('syncing');
   try{
-    await saveDB();
+    await storageSet(STORAGE_KEY, JSON.stringify({assets: DB, log: LOG}));
+    lastLocalSaveTs = Date.now();
     setSyncStatus('ok');
     alert('This device\'s data has been pushed to the cloud.');
   }catch(e){
@@ -839,43 +888,12 @@ async function forcePushLocalToCloud(){
   }
 }
 
-/* Used specifically when a device connects to a Sheets URL for the first
-   time (see saveSheetsUrl). Unlike routine polling, this explicitly
-   decides which side should win when they differ:
-   - remote has real data (even if different from local)  -> remote wins,
-     this device adopts the shared data (normal "join an existing team's
-     data" case).
-   - remote is empty but this device has local data -> this device's data
-     is pushed UP to become the shared starting point (this is the "first
-     device to ever connect" case that was previously wiping data). */
+/* Used when a device connects to a Sheets URL for the first time — same
+   merge logic as routine sync, just triggered immediately instead of
+   waiting for the next poll. */
 async function connectToSheetsAndReconcile(){
   setSyncStatus('syncing');
-  try{
-    const json = await sheetsLoad();
-    const parsed = json ? JSON.parse(json) : { assets: [], log: [] };
-    const remoteDB = Array.isArray(parsed) ? parsed : (parsed.assets || []);
-    const remoteLog = Array.isArray(parsed) ? [] : (parsed.log || []);
-
-    if(remoteDB.length === 0 && DB.length > 0){
-      // Remote is empty, we have real local data — push local up to seed it.
-      await saveDB();
-    } else if(remoteDB.length > 0){
-      // Remote has real data — adopt it as the shared source of truth.
-      applyingRemoteUpdate = true;
-      DB = remoteDB;
-      LOG = remoteLog;
-      DB.forEach((r,i)=> { if(!r._id) r._id = i+1; });
-      nextId = Math.max(0, ...DB.map(r=>r._id), nextId) + 1;
-      localStorage.setItem(STORAGE_KEY, json);
-      renderAll();
-      applyingRemoteUpdate = false;
-    }
-    // both empty -> nothing to do either way
-    setSyncStatus('ok');
-  }catch(e){
-    console.error('Initial Sheets connect failed', e);
-    setSyncStatus('error');
-  }
+  await syncWithCloud();
 }
 
 async function loadDB(){
@@ -906,8 +924,25 @@ async function saveDB(){
   if(applyingRemoteUpdate) return; // avoid feedback loop while applying an incoming update
   saveInFlight++;
   try{
+    // If cloud sync is on, merge with whatever's currently in the sheet
+    // right before writing — this prevents this save from stomping a
+    // concurrent edit made on another device that hasn't synced here yet.
+    if(getSheetsSyncUrl() && !window.storage){
+      try{
+        const remote = await fetchRemote();
+        const mergedAssets = mergeAssetSets(DB, remote.assets);
+        const mergedLog = mergeLogs(LOG, remote.log);
+        if(JSON.stringify(mergedAssets) !== JSON.stringify(DB) || JSON.stringify(mergedLog) !== JSON.stringify(LOG)){
+          DB = mergedAssets;
+          LOG = mergedLog;
+          DB.forEach((r,i)=> { if(!r._id) r._id = i+1; });
+          nextId = Math.max(0, ...DB.map(r=>r._id), nextId, 0) + 1;
+        }
+      }catch(e){ console.error('Pre-save merge fetch failed — saving local-only state', e); }
+    }
     await storageSet(STORAGE_KEY, JSON.stringify({assets: DB, log: LOG}));
     lastLocalSaveTs = Date.now();
+    renderAll();
   }catch(e){ console.error('Storage error', e); }
   finally{ saveInFlight--; }
 }
