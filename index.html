@@ -457,11 +457,11 @@ textarea#importArea{ width:100%; min-height:160px; font-family: var(--mono); fon
       </div>
       <div class="panel">
         <div class="import-help">
-          Paste CSV data with header row: <code>Branch,Floor,Room / Area,Asset Category,Asset Name,Make,Model,Serial No,Quantity,Status,Remarks</code><br>
-          This is the same column layout as your ASSETLINE export sheet. Rows are merged into the database — matching rows (same Branch + Floor + Room + Asset Name + Serial) are updated in place, new rows are added, and everything else stays untouched.
+          Paste CSV data with header row: <code>Branch,Floor,Room / Area,Asset Category,Asset Name,Make,Model,Serial No,Quantity,Status,Remarks,Global ID,Employee Name,Employee Phone,Processor,RAM,Storage (GB),Storage Type,HDD Storage,Keyboard Qty,Mouse Qty,NVR/DVR Storage,GPS Location</code><br>
+          This is the same column layout as the NSPIRA IT Assets Collector app's export. The first 11 columns are required — everything from Global ID onward is optional and only needed if you want hardware config, HDD, employee assignment, or GPS data carried over too. Rows are merged into the database — matching rows (same Branch + Floor + Room + Asset Name + Serial) are updated in place, new rows are added, and everything else stays untouched.
         </div>
-        <textarea id="importArea" placeholder="Branch,Floor,Room / Area,Asset Category,Asset Name,Make,Model,Serial No,Quantity,Status,Remarks
-AP-KRI-VIJ-EXAMPLE,Ground Floor,Reception,CCTV Camera,IP Dome Camera 2MP,Dahua,-,-,1,Working,"></textarea>
+        <textarea id="importArea" placeholder="Branch,Floor,Room / Area,Asset Category,Asset Name,Make,Model,Serial No,Quantity,Status,Remarks,Global ID,Employee Name,Employee Phone,Processor,RAM,Storage (GB),Storage Type,HDD Storage,Keyboard Qty,Mouse Qty,NVR/DVR Storage,GPS Location
+AP-KRI-VIJ-EXAMPLE,Ground Floor,Reception,CCTV Camera,IP Dome Camera 2MP,Dahua,-,-,1,Working,,,,,,,,,,,,"></textarea>
         <div class="controls-row" style="margin-top:12px;">
           <button class="btn primary" onclick="handleImport()">Merge into database</button>
           <button class="btn ghost" onclick="document.getElementById('importArea').value=''">Clear</button>
@@ -1172,10 +1172,10 @@ function exportCSV(){
 }
 
 function downloadCSV(rows, filename){
-  const headers = ['Branch','Floor','Room / Area','Asset Category','Asset Name','Make','Model','Serial No','Quantity','Status','Remarks'];
+  const headers = ['Branch','Floor','Room / Area','Asset Category','Asset Name','Make','Model','Serial No','Quantity','Status','Remarks','Global ID','Employee Name','Employee Phone','Processor','RAM','Storage (GB)','Storage Type','HDD Storage','Keyboard Qty','Mouse Qty','NVR/DVR Storage','GPS Location'];
   const lines = [headers.join(',')];
   rows.forEach(r=>{
-    const vals = [r.branch,r.floor,r.room,r.category,r.name,r.make,r.model,r.serial,r.qty,r.status,r.remarks];
+    const vals = [r.branch,r.floor,r.room,r.category,r.name,r.make,r.model,r.serial,r.qty,r.status,r.remarks,r.globalId,r.empName,r.empPhone,r.processor,r.ram,r.storageGb,r.storageType,r.hddStorage,r.keyboardQty,r.mouseQty,r.nvrStorage,r.gps];
     lines.push(vals.map(csvEscape).join(','));
   });
   const blob = new Blob([lines.join('\n')], {type:'text/csv'});
@@ -1349,6 +1349,18 @@ function parseCSV(text){
       qty: (cols[8]||'1').trim(),
       status: (cols[9]||'Working').trim(),
       remarks: (cols[10]||'').trim(),
+      globalId: (cols[11]||'').trim(),
+      empName: (cols[12]||'').trim(),
+      empPhone: (cols[13]||'').trim(),
+      processor: (cols[14]||'').trim(),
+      ram: (cols[15]||'').trim(),
+      storageGb: (cols[16]||'').trim(),
+      storageType: (cols[17]||'').trim(),
+      hddStorage: (cols[18]||'').trim(),
+      keyboardQty: (cols[19]||'').trim(),
+      mouseQty: (cols[20]||'').trim(),
+      nvrStorage: (cols[21]||'').trim(),
+      gps: (cols[22]||'').trim(),
     });
   }
   return rows.filter(r=>r.branch && r.name);
