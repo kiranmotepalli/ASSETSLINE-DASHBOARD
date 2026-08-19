@@ -1,4 +1,4 @@
-const CACHE_NAME = 'assetline-dashboard-v9';
+const CACHE_NAME = 'assetline-dashboard-v10';
 const ASSETS = [
   './',
   './index.html',

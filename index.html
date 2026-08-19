@@ -458,7 +458,7 @@ textarea#importArea{ width:100%; min-height:160px; font-family: var(--mono); fon
       <div class="panel">
         <div class="import-help">
           Paste CSV data with header row: <code>Branch,Floor,Room / Area,Asset Category,Asset Name,Make,Model,Serial No,Quantity,Status,Remarks,Global ID,Employee Name,Employee Phone,Processor,RAM,Storage (GB),Storage Type,HDD Storage,Keyboard Qty,Mouse Qty,NVR/DVR Storage,GPS Location</code><br>
-          This is the same column layout as the NSPIRA IT Assets Collector app's export. The first 11 columns are required — everything from Global ID onward is optional and only needed if you want hardware config, HDD, employee assignment, or GPS data carried over too. Rows are merged into the database — matching rows (same Branch + Floor + Room + Asset Name + Serial) are updated in place, new rows are added, and everything else stays untouched.
+          This is the same column layout as the NSPIRA IT Assets Collector app's export. The first 11 columns are required — everything from Global ID onward is optional and only needed if you want hardware config, HDD, employee assignment, or GPS data carried over too. Rows are merged into the database — matching rows (same Branch + Floor + Room + Asset Name + Serial) are updated in place, new rows are added, and everything else stays untouched. Selecting <b>multiple CSV files</b> at once (e.g. one per branch) merges all of them in one go — no need to paste them together.
         </div>
         <textarea id="importArea" placeholder="Branch,Floor,Room / Area,Asset Category,Asset Name,Make,Model,Serial No,Quantity,Status,Remarks,Global ID,Employee Name,Employee Phone,Processor,RAM,Storage (GB),Storage Type,HDD Storage,Keyboard Qty,Mouse Qty,NVR/DVR Storage,GPS Location
 AP-KRI-VIJ-EXAMPLE,Ground Floor,Reception,CCTV Camera,IP Dome Camera 2MP,Dahua,-,-,1,Working,,,,,,,,,,,,"></textarea>
@@ -466,8 +466,8 @@ AP-KRI-VIJ-EXAMPLE,Ground Floor,Reception,CCTV Camera,IP Dome Camera 2MP,Dahua,-
           <button class="btn primary" onclick="handleImport()">Merge into database</button>
           <button class="btn ghost" onclick="document.getElementById('importArea').value=''">Clear</button>
           <label class="btn ghost" style="cursor:pointer;">
-            Upload CSV file
-            <input type="file" id="csvFile" accept=".csv" style="display:none;">
+            Upload CSV file(s)
+            <input type="file" id="csvFile" accept=".csv" multiple style="display:none;">
           </label>
         </div>
         <div class="import-status" id="importStatus"></div>
@@ -1323,12 +1323,67 @@ function exportReportCSV(){
 
 /* ============ IMPORT ============ */
 document.getElementById('csvFile').addEventListener('change', (e)=>{
-  const file = e.target.files[0];
-  if(!file) return;
-  const reader = new FileReader();
-  reader.onload = (evt)=>{ document.getElementById('importArea').value = evt.target.result; };
-  reader.readAsText(file);
+  const files = Array.from(e.target.files || []);
+  e.target.value = ''; // allow picking the same file(s) again later
+  if(files.length === 0) return;
+
+  if(files.length === 1){
+    // single file — load it into the textarea for review before merging,
+    // same as before
+    const reader = new FileReader();
+    reader.onload = (evt)=>{ document.getElementById('importArea').value = evt.target.result; };
+    reader.readAsText(files[0]);
+    return;
+  }
+
+  handleMultiFileImport(files);
 });
+
+function readFileAsText(file){
+  return new Promise((resolve, reject)=>{
+    const reader = new FileReader();
+    reader.onload = (evt)=> resolve(evt.target.result);
+    reader.onerror = reject;
+    reader.readAsText(file);
+  });
+}
+
+async function handleMultiFileImport(files){
+  const statusEl = document.getElementById('importStatus');
+  statusEl.className = 'import-status';
+  statusEl.textContent = `Reading ${files.length} files…`;
+
+  let totalAdded = 0, totalUpdated = 0;
+  const perFile = [];
+  const badFiles = [];
+
+  for(const file of files){
+    try{
+      const text = await readFileAsText(file);
+      const parsed = parseCSV(text);
+      if(parsed.length === 0){
+        badFiles.push(file.name);
+        continue;
+      }
+      const {added, updated} = mergeRowsIntoDB(parsed);
+      totalAdded += added;
+      totalUpdated += updated;
+      perFile.push(`${file.name}: +${added} / ~${updated}`);
+    }catch(e){
+      badFiles.push(file.name);
+    }
+  }
+
+  await saveDB();
+  renderAll();
+
+  statusEl.className = (totalAdded + totalUpdated) > 0 ? 'import-status ok' : 'import-status err';
+  let msg = `Merged ${files.length - badFiles.length} of ${files.length} files — ${totalAdded} new row(s) added, ${totalUpdated} row(s) updated. Database now has ${DB.length} total line items.`;
+  if(badFiles.length){
+    msg += ` Couldn't read: ${badFiles.join(', ')}.`;
+  }
+  statusEl.textContent = msg;
+}
 
 function parseCSV(text){
   const lines = text.split(/\r?\n/).filter(l=>l.trim().length);
@@ -1384,15 +1439,7 @@ function splitCSVLine(line){
   return result;
 }
 
-async function handleImport(){
-  const text = document.getElementById('importArea').value;
-  const statusEl = document.getElementById('importStatus');
-  const parsed = parseCSV(text);
-  if(parsed.length === 0){
-    statusEl.className = 'import-status err';
-    statusEl.textContent = 'No valid rows found. Check the CSV format matches the header shown above.';
-    return;
-  }
+function mergeRowsIntoDB(parsed){
   let updated = 0, added = 0;
   parsed.forEach(newRow=>{
     const key = makeKey(newRow);
@@ -1406,6 +1453,19 @@ async function handleImport(){
       added++;
     }
   });
+  return {added, updated};
+}
+
+async function handleImport(){
+  const text = document.getElementById('importArea').value;
+  const statusEl = document.getElementById('importStatus');
+  const parsed = parseCSV(text);
+  if(parsed.length === 0){
+    statusEl.className = 'import-status err';
+    statusEl.textContent = 'No valid rows found. Check the CSV format matches the header shown above.';
+    return;
+  }
+  const {added, updated} = mergeRowsIntoDB(parsed);
   await saveDB();
   renderAll();
   statusEl.className = 'import-status ok';
